@@ -104,6 +104,17 @@ bridge:
     sy7: 8.5
     stheta7: 3.14
 
+    # Virtual obstacles, min-merged into every published scan (bridge-side
+    # only: every lidar sees them, the physics never collides with them).
+    # Format: 'x,y[,r]; x,y[,r]; ...' in map metres; empty string = none.
+    # At runtime: publish a point in RViz/Foxglove (/clicked_point) to toggle
+    # an obstacle at the click, publish std_msgs/Empty on /clear_obstacles to
+    # wipe them, or `ros2 param set /bridge obstacles "x,y,r; ..."` to replace
+    # the whole set. Markers on /obstacle_markers show the current set.
+    obstacles: ''
+    # Radius (m) used for clicked obstacles and 'x,y' entries without one.
+    obstacle_radius: 0.2
+
     # teleop
     kb_teleop: True
 

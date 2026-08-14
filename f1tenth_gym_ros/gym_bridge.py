@@ -22,15 +22,22 @@
 
 import math
 import pathlib
+from dataclasses import fields as dataclass_fields
 from functools import partial
 
 import rclpy
+import yaml
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy
+from rcl_interfaces.msg import SetParametersResult
 from rosgraph_msgs.msg import Clock
 from std_msgs.msg import Bool
+from std_msgs.msg import Empty
+from visualization_msgs.msg import Marker, MarkerArray
 
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
+from geometry_msgs.msg import PointStamped
 from geometry_msgs.msg import PoseStamped
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from geometry_msgs.msg import Twist
@@ -65,7 +72,9 @@ from f1tenth_gym.envs.integrators import IntegratorType
 from f1tenth_gym.envs.lidar import LiDARConfig
 from f1tenth_gym.envs.observation import ObservationType
 from f1tenth_gym.envs.reset import ResetStrategy
-from f1tenth_gym.envs.track import Track, Raceline
+from f1tenth_gym.envs.track import Track, TrackSpec, Raceline
+
+from f1tenth_gym_ros.obstacles import ObstacleField
 
 
 def opp_suffix(opp_index):
@@ -103,8 +112,22 @@ def _resolve_map_yaml_path(map_path: str) -> pathlib.Path | None:
     return yaml_path if yaml_path.exists() else None
 
 
+def _make_track_spec(map_yaml_path: pathlib.Path) -> TrackSpec:
+    """Build a TrackSpec from a map yaml, ignoring keys the gym doesn't model.
+
+    Yamls written by slam_toolbox / nav2 map_saver carry extra keys such as
+    'mode: trinary' that TrackSpec's strict dataclass constructor rejects, so
+    filter down to the known fields instead of calling Track.load_spec.
+    """
+    with open(map_yaml_path, 'r') as yaml_stream:
+        map_metadata = yaml.safe_load(yaml_stream)
+    known_fields = {f.name for f in dataclass_fields(TrackSpec)} - {'name'}
+    map_metadata = {k: v for k, v in map_metadata.items() if k in known_fields}
+    return TrackSpec(name=map_yaml_path.stem, **map_metadata)
+
+
 def _load_track_from_yaml(map_yaml_path: pathlib.Path, scale: float) -> tuple[Track, bool]:
-    track_spec = Track.load_spec(track=map_yaml_path.stem, filespec=str(map_yaml_path))
+    track_spec = _make_track_spec(map_yaml_path)
     track_spec.resolution = track_spec.resolution * scale
     track_spec.origin = (
         track_spec.origin[0] * scale,
@@ -202,6 +225,10 @@ class GymBridge(Node):
         self.declare_parameter('sy', 0.0)
         self.declare_parameter('stheta', 0.0)
         self.declare_parameter('kb_teleop', True)
+        # Virtual obstacles: 'x,y[,r]; x,y[,r]; ...' in map metres, see
+        # f1tenth_gym_ros/obstacles.py. Also settable at runtime.
+        self.declare_parameter('obstacles', '')
+        self.declare_parameter('obstacle_radius', 0.2)
         self.declare_parameter('scale', 1.0)
         self.declare_parameter('vehicle_params', 'f1tenth')
         self.declare_parameter('async_mode', True)
@@ -257,8 +284,10 @@ class GymBridge(Node):
                 has_reference_line = (
                     loaded_map.centerline is not None or loaded_map.raceline is not None
                 )
-            except (ValueError, FileNotFoundError) as ex:
-                if isinstance(ex, FileNotFoundError) or "centerline" in str(ex) or "raceline" in str(ex):
+            except (ValueError, FileNotFoundError, TypeError) as ex:
+                # TypeError: TrackSpec rejecting extra yaml keys such as 'mode'
+                if (isinstance(ex, (FileNotFoundError, TypeError))
+                        or "centerline" in str(ex) or "raceline" in str(ex)):
                     loaded_map, has_reference_line = _load_track_from_yaml(map_yaml_path, scale)
                 else:
                     raise
@@ -357,6 +386,17 @@ class GymBridge(Node):
         ego_odom_topic = self.ego_namespace + '/' + self.get_parameter('ego_odom_topic').value
         self.scan_tf = self.lidar_cfg.base_link_to_lidar_tf
 
+        # Virtual obstacles, min-merged into every published scan. They live
+        # only on the bridge side: the gym's physics/raycast never sees them,
+        # so driving through one logs a warning instead of crashing the car.
+        self.lidar_noise_std = lidar_noise_std
+        self.obstacle_rng = np.random.default_rng()
+        self.beam_angles = (
+            self.angle_min + np.arange(self.lidar_cfg.num_beams) * self.angle_inc
+        )
+        self.obstacles = ObstacleField(self.get_parameter('obstacle_radius').value)
+        self.obstacles.set_from_spec(self.get_parameter('obstacles').value)
+
         # Opponents (agents 1..num_agents-1). Namespaces and topics for opponent i
         # are the opp_* parameters suffixed with the opponent index ('' for the
         # first opponent, so 1 and 2 agent setups behave exactly as before):
@@ -409,6 +449,11 @@ class GymBridge(Node):
 
         # publishers
         self.ego_scan_pub = self.create_publisher(LaserScan, ego_scan_topic, 10)
+        # Latched so RViz/Foxglove sessions opened later still see the markers
+        self.obstacle_marker_pub = self.create_publisher(
+            MarkerArray, '/obstacle_markers',
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self._publish_obstacle_markers()
         self.ego_odom_pub = self.create_publisher(Odometry, ego_odom_topic, 10)
         self.ego_drive_published = False
         for opp in self.opps:
@@ -464,6 +509,23 @@ class GymBridge(Node):
             self.pause_callback,
             10)
 
+        # Obstacle editing: a published point (RViz/Foxglove 'Publish Point')
+        # toggles — click free space to drop an obstacle, click an existing
+        # one to remove it. /clear_obstacles wipes the whole set.
+        self.clicked_point_sub = self.create_subscription(
+            PointStamped,
+            '/clicked_point',
+            self.clicked_point_callback,
+            10)
+        self.clear_obstacles_sub = self.create_subscription(
+            Empty,
+            '/clear_obstacles',
+            self.clear_obstacles_callback,
+            10)
+        # Whole-set replacement at runtime:
+        #   ros2 param set /bridge obstacles "x,y,r; x,y,r"
+        self.add_on_set_parameters_callback(self._on_set_parameters)
+
     def _opp_start_poses(self, num_agents):
         """Read sx/sy/stheta for each opponent, reporting any left unset.
 
@@ -489,6 +551,85 @@ class GymBridge(Node):
     def pause_callback(self, msg):
         self.sim_paused = msg.data
         self.get_logger().info(f"Simulation {'paused' if self.sim_paused else 'resumed'}")
+
+    def clicked_point_callback(self, msg):
+        x, y = msg.point.x, msg.point.y
+        if self.obstacles.remove_at(x, y):
+            self.get_logger().info(f'Removed obstacle at ({x:.2f}, {y:.2f})')
+        else:
+            self.obstacles.add(x, y)
+            self.get_logger().info(
+                f'Added obstacle at ({x:.2f}, {y:.2f}) '
+                f'r={self.obstacles.default_radius:.2f}')
+        self._publish_obstacle_markers()
+
+    def clear_obstacles_callback(self, msg):
+        self.obstacles.clear()
+        self._publish_obstacle_markers()
+        self.get_logger().info('Cleared all obstacles')
+
+    def _on_set_parameters(self, params):
+        for param in params:
+            if param.name == 'obstacles':
+                try:
+                    self.obstacles.set_from_spec(param.value)
+                except (TypeError, ValueError) as ex:
+                    return SetParametersResult(successful=False, reason=str(ex))
+                self._publish_obstacle_markers()
+                self.get_logger().info(
+                    f"Obstacles set: [{self.obstacles.to_spec() or 'none'}]")
+            elif param.name == 'obstacle_radius':
+                if not isinstance(param.value, (int, float)) or param.value <= 0.0:
+                    return SetParametersResult(
+                        successful=False, reason='obstacle_radius must be > 0')
+                self.obstacles.default_radius = float(param.value)
+        return SetParametersResult(successful=True)
+
+    def _publish_obstacle_markers(self):
+        ts = self.get_clock().now().to_msg()
+        marker_array = MarkerArray()
+        wipe = Marker()
+        wipe.header.frame_id = 'map'
+        wipe.header.stamp = ts
+        wipe.action = Marker.DELETEALL
+        marker_array.markers.append(wipe)
+        for i, (x, y, r) in enumerate(self.obstacles.circles):
+            marker = Marker()
+            marker.header.frame_id = 'map'
+            marker.header.stamp = ts
+            marker.ns = 'obstacles'
+            marker.id = i
+            marker.type = Marker.CYLINDER
+            marker.action = Marker.ADD
+            marker.pose.position.x = x
+            marker.pose.position.y = y
+            marker.pose.position.z = 0.25
+            marker.pose.orientation.w = 1.0
+            marker.scale.x = 2.0 * r
+            marker.scale.y = 2.0 * r
+            marker.scale.z = 0.5
+            marker.color.r = 1.0
+            marker.color.g = 0.4
+            marker.color.b = 0.1
+            marker.color.a = 0.85
+            marker_array.markers.append(marker)
+        self.obstacle_marker_pub.publish(marker_array)
+
+    def _lidar_pose(self, pose):
+        """World pose of the lidar for a car at base_link pose [x, y, yaw]."""
+        c, s = math.cos(pose[2]), math.sin(pose[2])
+        lx = pose[0] + c * self.scan_tf[0] - s * self.scan_tf[1]
+        ly = pose[1] + s * self.scan_tf[0] + c * self.scan_tf[1]
+        return lx, ly, pose[2] + self.scan_tf[2]
+
+    def _scan_with_obstacles(self, ranges, pose):
+        """Scan ranges as a float list with the virtual obstacles merged in."""
+        lidar_x, lidar_y, lidar_yaw = self._lidar_pose(pose)
+        merged = self.obstacles.inject(
+            ranges, lidar_x, lidar_y, lidar_yaw, self.beam_angles,
+            self.scan_range_min, noise_std=self.lidar_noise_std,
+            rng=self.obstacle_rng)
+        return [float(x) for x in merged]
 
     def drive_callback(self, drive_msg):
         if self.sim_paused:
@@ -567,6 +708,16 @@ class GymBridge(Node):
         _, _, self.done, _, _ = self.env.step(np.array(actions))
         self._update_sim_state()
 
+        # The physics can't collide with virtual obstacles, so at least say so.
+        # Margin ~ half the car's width.
+        hit = self.obstacles.hit_index(
+            self.ego_pose[0], self.ego_pose[1], margin=0.15)
+        if hit >= 0:
+            self.get_logger().warning(
+                f'Ego overlaps virtual obstacle {hit} — '
+                'a real car would have crashed',
+                throttle_duration_sec=1.0)
+
         # Advance the visual wheel spin by the no-slip rolling rate v/r. The ST
         # dynamics model carries no wheel-speed states, so this is the closest
         # thing to the actual wheel RPM the sim can provide.
@@ -596,12 +747,12 @@ class GymBridge(Node):
             ts.sec = int(sim_time // 1.0)
             ts.nanosec = int((sim_time % 1.0) * 1e9)
 
-        # pub scans
-        self.ego_scan = [float(x) for x in self.ego_scan]
-        self.ego_scan_pub.publish(self._make_scan_msg(ts, self.ego_namespace, self.ego_scan))
+        # pub scans, with the virtual obstacles merged into every one
+        ego_ranges = self._scan_with_obstacles(self.ego_scan, self.ego_pose)
+        self.ego_scan_pub.publish(self._make_scan_msg(ts, self.ego_namespace, ego_ranges))
         for opp in self.opps:
-            opp.scan = [float(x) for x in opp.scan]
-            opp.scan_pub.publish(self._make_scan_msg(ts, opp.namespace, opp.scan))
+            opp_ranges = self._scan_with_obstacles(opp.scan, opp.pose)
+            opp.scan_pub.publish(self._make_scan_msg(ts, opp.namespace, opp_ranges))
 
         # pub tf
         self._publish_odom(ts)

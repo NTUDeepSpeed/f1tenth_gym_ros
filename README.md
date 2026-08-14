@@ -132,6 +132,33 @@ ros2 launch f1tenth_gym_ros gym_bridge_launch.py foxglove_target:=studio
 
 The entire directory of the repo is mounted to a workspace `/sim_ws/src` as a package. All changes made in the repo on the host system will also reflect in the container. After changing the configuration, run `colcon build` again in the container workspace to make sure the changes are reflected.
 
+# Virtual obstacles (NTU fork)
+
+The bridge can inject cylindrical obstacles into every published laser scan for
+testing obstacle detection and avoidance. They exist only on the bridge side:
+each scan is min-merged with an exact ray/circle intersection per beam, so
+obstacles occlude walls and are occluded by them — but the physics never
+collides with them (driving through one logs a warning instead of crashing).
+
+- Configure at launch: `obstacles: 'x,y[,r]; x,y[,r]; ...'` in `sim.yaml` (map
+  metres), or `obstacles:='...'` on the `ros2 launch` command line. Entries
+  without a radius use `obstacle_radius` (default 0.2 m).
+- Edit at runtime: use **Publish Point** in RViz/Foxglove — a click on free
+  space drops an obstacle there, a click on an existing obstacle removes it.
+  `ros2 topic pub --once /clear_obstacles std_msgs/msg/Empty` wipes the set,
+  and `ros2 param set /bridge obstacles "x,y,r; ..."` replaces it wholesale.
+- The current set is drawn as latched cylinder markers on `/obstacle_markers`.
+
+The launch file also accepts `map_path:=`, `sx:=`, `sy:=` and `stheta:=`
+overrides so a different track and start pose can be chosen without editing
+`sim.yaml`, e.g. running against a map from another workspace:
+
+```bash
+ros2 launch f1tenth_gym_ros gym_bridge_launch.py \
+    map_path:=/sim_ws/maps/cavr2 sx:=-0.14 sy:=4.65 stheta:=-0.73 \
+    obstacles:='-0.89,0.21,0.2'
+```
+
 # Topics published by the simulation
 
 In **single** agent:

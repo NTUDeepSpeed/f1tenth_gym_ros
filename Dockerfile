@@ -20,7 +20,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-ARG ROS_DISTRO=humble
+# NTU fork: default to jazzy to match the race stack (upstream defaults to
+# humble). Override with --build-arg ROS_DISTRO=humble if needed.
+ARG ROS_DISTRO=jazzy
 
 FROM ros:${ROS_DISTRO}
 

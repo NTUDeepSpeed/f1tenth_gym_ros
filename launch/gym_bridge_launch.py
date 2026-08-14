@@ -84,6 +84,18 @@ def _launch_setup(context, *args, **kwargs):
     teleop = config_dict['bridge']['ros__parameters']['kb_teleop']
     use_sim_time = config_dict['bridge']['ros__parameters']['use_sim_time']
 
+    # Command-line overrides for the sim config; an empty value keeps the
+    # config's setting (same convention as num_agent above).
+    cli_overrides = {}
+    for key in ('map_path', 'obstacles'):
+        value = LaunchConfiguration(key).perform(context).strip()
+        if value:
+            cli_overrides[key] = value
+    for key in ('sx', 'sy', 'stheta'):
+        value = LaunchConfiguration(key).perform(context).strip()
+        if value:
+            cli_overrides[key] = float(value)
+
     bridge_node = Node(
         package='f1tenth_gym_ros',
         executable='gym_bridge',
@@ -92,7 +104,8 @@ def _launch_setup(context, *args, **kwargs):
             'num_agent': num_agent,  # after config so that num_agent:= works
             'use_sim_time': False,  # Always use real time for the bridge node
             'use_sim_time_bridge': use_sim_time, # Whether to internally use and publish sim time
-            }], 
+            **cli_overrides,
+            }],
         # Nothing else is useful without the sim, so take the whole launch down
         # with it instead of leaving foxglove_bridge and map_server running.
         # Should make it clearer to the user that the gym died in the logs.
@@ -125,7 +138,7 @@ def _launch_setup(context, *args, **kwargs):
     foxglove_layout_log = LogInfo(msg=['\033[34mFoxglove layout: ', foxglove_layout, '\033[0m'])
 
     # Create custom yaml file for map server by copying the original yaml file and scaling the resolution.
-    map_path = config_dict['bridge']['ros__parameters']['map_path']
+    map_path = cli_overrides.get('map_path', config_dict['bridge']['ros__parameters']['map_path'])
     map_yaml_path = _resolve_map_yaml_path(map_path, package_share)
     with open(map_yaml_path, 'r') as file:
         map_yaml = yaml.safe_load(file)
@@ -283,6 +296,30 @@ def generate_launch_description():
             description='Number of agents (1 ego + opponents). Empty takes it from the sim config.',
         )
     )
+    ld.add_action(
+        DeclareLaunchArgument(
+            'map_path',
+            default_value='',
+            description='Map override: absolute path (with or without .yaml) or a '
+                        'name under the package maps/. Empty takes the sim config.',
+        )
+    )
+    ld.add_action(
+        DeclareLaunchArgument(
+            'obstacles',
+            default_value='',
+            description="Virtual obstacles override, 'x,y[,r]; x,y[,r]; ...' in map "
+                        'metres. Empty takes the sim config.',
+        )
+    )
+    for pose_key, what in (('sx', 'x'), ('sy', 'y'), ('stheta', 'yaw')):
+        ld.add_action(
+            DeclareLaunchArgument(
+                pose_key,
+                default_value='',
+                description=f'Ego start pose {what} override. Empty takes the sim config.',
+            )
+        )
     ld.add_action(
         DeclareLaunchArgument(
             'foxglove_host',
