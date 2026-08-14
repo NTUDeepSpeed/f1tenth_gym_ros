@@ -30,10 +30,12 @@ SHELL ["/bin/bash", "-c"]
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# screen + rosbridge-suite are NTU-fork additions: on hosts whose only ROS
-# lives in this container, the race stack itself runs in here too — run.sh
-# needs screen (ros_env.sh session management), and launch_master resolves
-# rosbridge_server's share dir at import time even when it isn't launched.
+# screen, rosbridge-suite and serial-driver are NTU-fork additions: on hosts
+# whose only ROS lives in this container, the race stack itself runs in here
+# too — run.sh needs screen (ros_env.sh session management), launch_master
+# resolves rosbridge_server's share dir at import time even when it isn't
+# launched, and vesc_driver (whose failure cascades into f1tenth_stack not
+# building, which launch_master also resolves) needs serial_driver to compile.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         git \
@@ -45,6 +47,7 @@ RUN apt-get update && \
         screen \
         tmux \
         ros-${ROS_DISTRO}-rosbridge-suite \
+        ros-${ROS_DISTRO}-serial-driver \
         ros-${ROS_DISTRO}-rviz2 && \
     rm -rf /var/lib/apt/lists/*
 
