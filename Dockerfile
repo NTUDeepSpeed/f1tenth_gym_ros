@@ -30,12 +30,14 @@ SHELL ["/bin/bash", "-c"]
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# screen, rosbridge-suite and serial-driver are NTU-fork additions: on hosts
-# whose only ROS lives in this container, the race stack itself runs in here
-# too — run.sh needs screen (ros_env.sh session management), launch_master
-# resolves rosbridge_server's share dir at import time even when it isn't
-# launched, and vesc_driver (whose failure cascades into f1tenth_stack not
-# building, which launch_master also resolves) needs serial_driver to compile.
+# Everything below the first block is an NTU-fork addition: on hosts whose
+# only ROS lives in this container, the race stack itself runs in here too.
+# run.sh needs screen (ros_env.sh session management); launch_master resolves
+# rosbridge_server's and f1tenth_stack's share dirs at import time even in sim
+# mode (and vesc_driver needs serial_driver to compile, else f1tenth_stack is
+# never processed); the rest are the stack's own rosdep keys, pre-installed so
+# `rosdep install` in a fresh container is a no-op — the image's apt lists are
+# wiped, so any rosdep-triggered install would first need an apt-get update.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         git \
@@ -46,8 +48,18 @@ RUN apt-get update && \
         libeigen3-dev \
         screen \
         tmux \
+        python3-pil \
+        python3-sklearn \
+        python3-tk \
+        ros-${ROS_DISTRO}-asio-cmake-module \
+        ros-${ROS_DISTRO}-control-msgs \
+        ros-${ROS_DISTRO}-diagnostic-updater \
+        ros-${ROS_DISTRO}-joy \
+        ros-${ROS_DISTRO}-robot-localization \
         ros-${ROS_DISTRO}-rosbridge-suite \
         ros-${ROS_DISTRO}-serial-driver \
+        ros-${ROS_DISTRO}-tf-transformations \
+        ros-${ROS_DISTRO}-urg-node \
         ros-${ROS_DISTRO}-rviz2 && \
     rm -rf /var/lib/apt/lists/*
 
@@ -84,6 +96,14 @@ RUN if [ "${ROS_DISTRO}" = "humble" ]; then \
     git clone --depth 1 --branch ${GYM_REF} \
         https://github.com/f1tenth/f1tenth_gym.git /opt/f1tenth_gym && \
     pip3 install --ignore-installed -c /tmp/pip-constraints.txt -e /opt/f1tenth_gym
+
+# The race stack's perception nodes import sklearn. Apt's python3-sklearn is
+# compiled against apt's numpy, but the gym install above put numpy 2.x in
+# /usr/local, which shadows it — mixing the two ABIs dies at import with
+# "numpy.dtype size changed". Ship a pip scikit-learn built for the pip numpy
+# in the same tree (-U, or pip sees the apt copy and skips). The apt
+# python3-sklearn above still matters: rosdep checks dpkg, not importability.
+RUN pip3 install -U scikit-learn
 
 COPY . /sim_ws/src/f1tenth_gym_ros
 
