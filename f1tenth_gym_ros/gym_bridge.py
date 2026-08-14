@@ -211,6 +211,11 @@ class GymBridge(Node):
         self.declare_parameter('opp_scan_topic', 'opp_scan')
         self.declare_parameter('opp_drive_topic', 'opp_drive')
         self.declare_parameter('lidar_enabled', True)
+        # Real scanners publish at 10-40 Hz; the render timer runs at 250 Hz.
+        # Publishing scans that fast floods slow (python) perception consumers
+        # into unbounded reliable-QoS backlogs — they end up processing scans
+        # tens of seconds stale. Cap scan publication at the sensor's rate.
+        self.declare_parameter('scan_rate', 40.0)
         self.declare_parameter('lidar_base_link_to_lidar_tf', [0.275, 0.0, 0.0])
         self.declare_parameter('lidar_noise_std', 0.01)
         self.declare_parameter('scan_num_beams', 1080)
@@ -229,6 +234,12 @@ class GymBridge(Node):
         # f1tenth_gym_ros/obstacles.py. Also settable at runtime.
         self.declare_parameter('obstacles', '')
         self.declare_parameter('obstacle_radius', 0.2)
+        # On wall contact the gym zeroes the colliding car's state vector in
+        # place (yaw included), leaving a car that faces +x and ignores its
+        # history — every crash turns into an undebuggable zombie. Respawn at
+        # the start poses instead, loudly. Set false to keep the raw gym
+        # behaviour.
+        self.declare_parameter('respawn_on_collision', True)
         self.declare_parameter('scale', 1.0)
         self.declare_parameter('vehicle_params', 'f1tenth')
         self.declare_parameter('async_mode', True)
@@ -271,6 +282,22 @@ class GymBridge(Node):
             self.vehicle_params = get_f1fifth_vehicle_parameters()
         else:
             raise ValueError('vehicle_params should be either f1tenth, fullscale, or f1fifth.')
+
+        # Optional steering-range override (rad; 0.0 keeps the vehicle preset).
+        # The gym's f1tenth preset locks at ±0.4189 rad — a 0.73 m turning
+        # radius — but real builds steer wider, and racelines optimized for
+        # them (cavr2's tightest corner is r=0.50 m) are geometrically
+        # undrivable in the sim without matching the range.
+        self.declare_parameter('steer_angle_max', 0.0)
+        steer_angle_max = float(self.get_parameter('steer_angle_max').value)
+        if steer_angle_max > 0.0:
+            # VehicleParameters is a frozen dataclass; with_updates is its API
+            self.vehicle_params = self.vehicle_params.with_updates(
+                s_max=steer_angle_max, s_min=-steer_angle_max)
+            wheelbase = self.vehicle_params.lf + self.vehicle_params.lr
+            self.get_logger().info(
+                f'Steering range overridden to ±{steer_angle_max:.3f} rad '
+                f'(full-lock radius {wheelbase / math.tan(steer_angle_max):.2f} m)')
         self.wheel_radius = WHEEL_RADIUS * VEHICLE_MESH_SCALE[vehicle_params_key]
 
         scale = self.get_parameter('scale').value
@@ -369,6 +396,13 @@ class GymBridge(Node):
         sy = self.get_parameter('sy').value
         stheta = self.get_parameter('stheta').value
         self.ego_pose = [sx, sy, stheta]
+        # Where a collision respawn puts the cars back. Updated by the
+        # /initialpose and /goal_pose reset callbacks so a manually re-placed
+        # car respawns where the operator last put it.
+        self.start_poses = [[sx, sy, stheta]] + [list(p) for p in opp_poses]
+        self._last_respawn_sim_time = float('-inf')
+        self._last_scan_pub_s = float('-inf')
+        self._pinned_steps = 0
         self.ego_speed = [0.0, 0.0, 0.0]
         self.ego_requested_speed = 0.0
         self.ego_steer = 0.0
@@ -552,6 +586,34 @@ class GymBridge(Node):
         self.sim_paused = msg.data
         self.get_logger().info(f"Simulation {'paused' if self.sim_paused else 'resumed'}")
 
+    def _handle_collision(self, collisions):
+        names = [self.ego_namespace] + [opp.namespace for opp in self.opps]
+        hit = ', '.join(n for n, c in zip(names, collisions) if c)
+        if not self.get_parameter('respawn_on_collision').value:
+            self.get_logger().warning(
+                f'Collision: {hit} hit a wall (respawn_on_collision is off)',
+                throttle_duration_sec=1.0)
+            return
+        sim_time = self.env.unwrapped.sim_time
+        if sim_time - self._last_respawn_sim_time < 1.0:
+            return
+        self._last_respawn_sim_time = sim_time
+        self.get_logger().warning(
+            f'Collision: {hit} hit a wall — respawning all cars at their start poses')
+        self._respawn_all()
+
+    def _respawn_all(self):
+        """Put every car back on its start pose with no residual commands."""
+        self.ego_pose = list(self.start_poses[0])
+        self.ego_requested_speed = 0.0
+        self.ego_steer = 0.0
+        for opp, pose in zip(self.opps, self.start_poses[1:]):
+            opp.pose = list(pose)
+            opp.requested_speed = 0.0
+            opp.steer = 0.0
+        self.env.reset(options={"poses": np.array(self._all_poses())})
+        self._update_sim_state()
+
     def clicked_point_callback(self, msg):
         x, y = msg.point.x, msg.point.y
         if self.obstacles.remove_at(x, y):
@@ -668,8 +730,16 @@ class GymBridge(Node):
         rqw = pose_msg.pose.pose.orientation.w
         rtheta = Rotation.from_quat([rqx, rqy, rqz, rqw]).as_euler('xyz')[2]
         self.ego_pose = [rx, ry, rtheta]
+        # The new pose is also the new respawn point — and stale drive
+        # commands must not immediately drive the freshly placed car into a
+        # wall (the async step timer replays the last request every 10 ms).
+        self.start_poses[0] = [rx, ry, rtheta]
+        self.ego_requested_speed = 0.0
+        self.ego_steer = 0.0
         self.env.reset(options={"poses": np.array(self._all_poses())})
         self._update_sim_state()
+        self.get_logger().info(
+            f'Ego reset to ({rx:.2f}, {ry:.2f}, {rtheta:.2f})')
 
     def opp_reset_callback(self, pose_msg, opp_index):
         if self.sim_paused:
@@ -682,7 +752,12 @@ class GymBridge(Node):
         rqz = pose_msg.pose.orientation.z
         rqw = pose_msg.pose.orientation.w
         rtheta = Rotation.from_quat([rqx, rqy, rqz, rqw]).as_euler('xyz')[2]
-        self.opps[opp_index].pose = [rx, ry, rtheta]
+        opp = self.opps[opp_index]
+        opp.pose = [rx, ry, rtheta]
+        # See ego_reset_callback: new respawn point, no stale commands.
+        self.start_poses[opp_index + 1] = [rx, ry, rtheta]
+        opp.requested_speed = 0.0
+        opp.steer = 0.0
         self.env.reset(options={"poses": np.array(self._all_poses())})
         self._update_sim_state()
 
@@ -707,6 +782,26 @@ class GymBridge(Node):
         actions += [[opp.steer, opp.requested_speed] for opp in self.opps]
         _, _, self.done, _, _ = self.env.step(np.array(actions))
         self._update_sim_state()
+
+        collisions = np.asarray(self.env.unwrapped.sim.collisions, dtype=bool)
+        if collisions.any():
+            self._handle_collision(collisions)
+
+        # Zombie detection: after a wall contact the gym zeroes the car's
+        # velocity every step it stays pressed against the wall, so it sits
+        # pinned without the collision flag re-firing. Commanded to move but
+        # not moving for 2 s = crashed in all but name.
+        if (self.get_parameter('respawn_on_collision').value
+                and abs(self.ego_requested_speed) > 0.3 and abs(self.ego_v) < 0.05):
+            self._pinned_steps += 1
+            if self._pinned_steps >= 200:  # 2 s of sim steps
+                self._pinned_steps = 0
+                self.get_logger().warning(
+                    'Ego pinned (commanded to move but stationary) — '
+                    'respawning all cars at their start poses')
+                self._respawn_all()
+        else:
+            self._pinned_steps = 0
 
         # The physics can't collide with virtual obstacles, so at least say so.
         # Margin ~ half the car's width.
@@ -747,12 +842,17 @@ class GymBridge(Node):
             ts.sec = int(sim_time // 1.0)
             ts.nanosec = int((sim_time % 1.0) * 1e9)
 
-        # pub scans, with the virtual obstacles merged into every one
-        ego_ranges = self._scan_with_obstacles(self.ego_scan, self.ego_pose)
-        self.ego_scan_pub.publish(self._make_scan_msg(ts, self.ego_namespace, ego_ranges))
-        for opp in self.opps:
-            opp_ranges = self._scan_with_obstacles(opp.scan, opp.pose)
-            opp.scan_pub.publish(self._make_scan_msg(ts, opp.namespace, opp_ranges))
+        # pub scans, with the virtual obstacles merged into every one — at the
+        # sensor's rate, not the render timer's (see scan_rate above)
+        now_s = self.get_clock().now().nanoseconds * 1e-9
+        scan_rate = float(self.get_parameter('scan_rate').value)
+        if scan_rate <= 0.0 or now_s - self._last_scan_pub_s >= 1.0 / scan_rate:
+            self._last_scan_pub_s = now_s
+            ego_ranges = self._scan_with_obstacles(self.ego_scan, self.ego_pose)
+            self.ego_scan_pub.publish(self._make_scan_msg(ts, self.ego_namespace, ego_ranges))
+            for opp in self.opps:
+                opp_ranges = self._scan_with_obstacles(opp.scan, opp.pose)
+                opp.scan_pub.publish(self._make_scan_msg(ts, opp.namespace, opp_ranges))
 
         # pub tf
         self._publish_odom(ts)

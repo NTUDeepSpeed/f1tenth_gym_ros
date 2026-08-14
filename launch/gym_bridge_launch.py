@@ -91,7 +91,7 @@ def _launch_setup(context, *args, **kwargs):
         value = LaunchConfiguration(key).perform(context).strip()
         if value:
             cli_overrides[key] = value
-    for key in ('sx', 'sy', 'stheta'):
+    for key in ('sx', 'sy', 'stheta', 'steer_angle_max'):
         value = LaunchConfiguration(key).perform(context).strip()
         if value:
             cli_overrides[key] = float(value)
@@ -320,6 +320,14 @@ def generate_launch_description():
                 description=f'Ego start pose {what} override. Empty takes the sim config.',
             )
         )
+    ld.add_action(
+        DeclareLaunchArgument(
+            'steer_angle_max',
+            default_value='',
+            description='Steering range override in rad (e.g. 0.65). Empty keeps '
+                        "the vehicle preset (f1tenth: ±0.4189, a 0.73 m radius).",
+        )
+    )
     ld.add_action(
         DeclareLaunchArgument(
             'foxglove_host',
