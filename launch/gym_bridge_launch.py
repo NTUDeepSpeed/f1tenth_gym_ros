@@ -25,11 +25,17 @@ import pathlib
 import yaml
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, LogInfo, SetLaunchConfiguration
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, LogInfo, OpaqueFunction, SetLaunchConfiguration, Shutdown
 from launch.conditions import IfCondition, LaunchConfigurationEquals
 from launch.substitutions import Command, LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from ament_index_python.packages import get_package_share_directory
+
+# Tints the accent mesh so ego and opponents stay as easy to tell apart as the
+# blue and orange boxes were. Same colours the primitive models use.
+EGO_ACCENT_COLOR = '0.3 0.57 1.0 1.0'
+OPP_ACCENT_COLOR = '1.0 0.57 0.1 1.0'
 
 
 def _resolve_yaml_path(base_path: pathlib.Path) -> pathlib.Path:
@@ -61,31 +67,36 @@ def _resolve_map_yaml_path(map_path: str, package_share: str) -> pathlib.Path:
     except Exception:
         return _resolve_yaml_path(pathlib.Path(package_share) / 'maps' / map_path)
 
-def generate_launch_description():
-    ld = LaunchDescription()
+def _launch_setup(context, *args, **kwargs):
+    # The number of cars decides how many robot_state_publishers to spawn, and
+    # launch arguments only have values inside an OpaqueFunction, so everything
+    # that reads the sim config is built here.
     package_share = get_package_share_directory('f1tenth_gym_ros')
-    config = os.path.join(package_share, 'config', 'sim.yaml')
+    config = LaunchConfiguration('config').perform(context)
+    if not os.path.isabs(config):
+        config = os.path.join(package_share, 'config', config)
     with open(config, 'r') as config_file:
         config_dict = yaml.safe_load(config_file)
-    has_opp = config_dict['bridge']['ros__parameters']['num_agent'] > 1
+    num_agent = LaunchConfiguration('num_agent').perform(context)  # command line wins
+    num_agent = int(num_agent) if num_agent.strip() else config_dict['bridge']['ros__parameters']['num_agent']
+    if num_agent < 1:
+        raise RuntimeError(f'num_agent must be at least 1, got {num_agent}.')
     teleop = config_dict['bridge']['ros__parameters']['kb_teleop']
     use_sim_time = config_dict['bridge']['ros__parameters']['use_sim_time']
-    foxglove_config = config_dict.get('foxglove', {})
-    if 'ros__parameters' in foxglove_config:
-        foxglove_config = foxglove_config['ros__parameters']
-    open_foxglove_default = str(foxglove_config.get('open_foxglove', True)).lower()
-    foxglove_target_default = str(foxglove_config.get('target', 'browser')).lower()
-    if foxglove_target_default not in ('browser', 'studio'):
-        raise ValueError("config/foxglove/target must be either 'browser' or 'studio'.")
 
     bridge_node = Node(
         package='f1tenth_gym_ros',
         executable='gym_bridge',
         name='bridge',
         parameters=[config, {
+            'num_agent': num_agent,  # after config so that num_agent:= works
             'use_sim_time': False,  # Always use real time for the bridge node
             'use_sim_time_bridge': use_sim_time, # Whether to internally use and publish sim time
             }], 
+        # Nothing else is useful without the sim, so take the whole launch down
+        # with it instead of leaving foxglove_bridge and map_server running.
+        # Should make it clearer to the user that the gym died in the logs.
+        on_exit=[Shutdown(reason='gym bridge exited')],
     )
     foxglove_host = LaunchConfiguration('foxglove_host')
     foxglove_port = LaunchConfiguration('foxglove_port')
@@ -176,44 +187,102 @@ def generate_launch_description():
     )
 
 
-    ego_xacro = None
-    if config_dict['bridge']['ros__parameters']['vehicle_params'] == 'f1tenth':
-        ego_xacro = "ego_racecar.xacro"
-    elif config_dict['bridge']['ros__parameters']['vehicle_params'] == 'fullscale':
-        ego_xacro = "ego_racecar_fullscale.xacro"
-    elif config_dict['bridge']['ros__parameters']['vehicle_params'] == 'f1fifth':
-        ego_xacro = "ego_racecar_f1fifth.xacro"
-    else:
-        raise ValueError('vehicle_params should be either f1tenth, fullscale, or f1fifth.')
-    
+    vehicle_params = config_dict['bridge']['ros__parameters']['vehicle_params']
+    urdf_dir = os.path.join(package_share, 'urdf')
+    ego_namespace = config_dict['bridge']['ros__parameters'].get('ego_namespace', 'ego_racecar')
+    opp_namespace = config_dict['bridge']['ros__parameters'].get('opp_namespace', 'opp_racecar')
+
+    def robot_description(car_name, accent_color):
+        """xacro command line for one car."""
+        # Quoted because the accent colour is an rgba string with spaces in it
+        # and Command shlex-splits what it is given.
+        # ParameterValue(value_type=str) stops launch from yaml-parsing the URDF
+        # string, which blows up on any "colon + space" in the xacro output.
+        return ParameterValue(Command([
+            'xacro ', os.path.join(urdf_dir, 'racecar_mesh.xacro'),
+            ' car_name:=', car_name,
+            ' accent_color:="', accent_color, '"',
+            ' vehicle:=', vehicle_params,
+        ]), value_type=str)
+
     ego_robot_publisher = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
         name='ego_robot_state_publisher',
         parameters=[
-            {'robot_description': Command([
-                'xacro ',
-                os.path.join(get_package_share_directory('f1tenth_gym_ros'), 'urdf', ego_xacro)
-            ])},
+            {'robot_description': robot_description(
+                ego_namespace, EGO_ACCENT_COLOR)},
             {'use_sim_time': use_sim_time},
         ],
         remappings=[('/robot_description', 'ego_robot_description')]
     )
-    opp_robot_publisher = Node(
-        package='robot_state_publisher',
-        executable='robot_state_publisher',
-        name='opp_robot_state_publisher',
-        parameters=[
-            {'robot_description': Command([
-                'xacro ',
-                os.path.join(get_package_share_directory('f1tenth_gym_ros'), 'urdf', 'opp_racecar.xacro')
-            ])},
-            {'use_sim_time': use_sim_time},
-        ],
-        remappings=[('/robot_description', 'opp_robot_description')]
-    )
+    # One publisher per opponent, matching the namespaces the bridge publishes
+    # TF for: opp_racecar, opp_racecar2, opp_racecar3, ...
+    opp_robot_publishers = []
+    for i in range(1, num_agent):
+        suffix = '' if i == 1 else str(i)  # first opponent keeps the unsuffixed names
+        opp_robot_publishers.append(Node(
+            package='robot_state_publisher',
+            executable='robot_state_publisher',
+            name='opp_robot_state_publisher' + suffix,
+            parameters=[
+                {'robot_description': robot_description(
+                    opp_namespace + suffix, OPP_ACCENT_COLOR)},
+                {'use_sim_time': use_sim_time},
+            ],
+            remappings=[('/robot_description', 'opp_robot_description' + suffix)]
+        ))
+
+    return [
+        foxglove_bridge_node,
+        foxglove_open,
+        bridge_node,
+        nav_lifecycle_node,
+        map_server_node,
+        ego_robot_publisher,
+        *opp_robot_publishers,
+        foxglove_log,
+        foxglove_ws_log,
+        foxglove_target_log,
+        foxglove_layout_log,
+    ]
+
+
+def generate_launch_description():
+    ld = LaunchDescription()
+    package_share = get_package_share_directory('f1tenth_gym_ros')
+    # Foxglove defaults come from the default config, because launch argument
+    # defaults have to exist before config:= can be resolved. Override them on the
+    # command line if your config carries different foxglove settings.
+    with open(os.path.join(package_share, 'config', 'sim.yaml'), 'r') as config_file:
+        foxglove_config = yaml.safe_load(config_file).get('foxglove', {})
+    if 'ros__parameters' in foxglove_config:
+        foxglove_config = foxglove_config['ros__parameters']
+    open_foxglove_default = str(foxglove_config.get('open_foxglove', True)).lower()
+    foxglove_target_default = str(foxglove_config.get('target', 'browser')).lower()
+    if foxglove_target_default not in ('browser', 'studio'):
+        raise ValueError("config/foxglove/target must be either 'browser' or 'studio'.")
+
+    # referenced by the foxglove_open_url substitutions below
+    foxglove_host = LaunchConfiguration('foxglove_host')
+    foxglove_port = LaunchConfiguration('foxglove_port')
+    foxglove_app_url = LaunchConfiguration('foxglove_app_url')
 
     # finalize
+    ld.add_action(
+        DeclareLaunchArgument(
+            'config',
+            default_value='sim.yaml',
+            description='Sim config: a file name in config/, or an absolute path.',
+        )
+    )
+    ld.add_action(
+        DeclareLaunchArgument(
+            'num_agent',
+            default_value='',
+            description='Number of agents (1 ego + opponents). Empty takes it from the sim config.',
+        )
+    )
     ld.add_action(
         DeclareLaunchArgument(
             'foxglove_host',
@@ -269,17 +338,6 @@ def generate_launch_description():
             condition=LaunchConfigurationEquals('foxglove_target', 'studio'),
         )
     )
-    ld.add_action(foxglove_bridge_node)
-    ld.add_action(foxglove_open)
-    ld.add_action(bridge_node)
-    ld.add_action(nav_lifecycle_node)
-    ld.add_action(map_server_node)
-    ld.add_action(ego_robot_publisher)
-    if has_opp:
-        ld.add_action(opp_robot_publisher)
-    ld.add_action(foxglove_log)
-    ld.add_action(foxglove_ws_log)
-    ld.add_action(foxglove_target_log)
-    ld.add_action(foxglove_layout_log)
+    ld.add_action(OpaqueFunction(function=_launch_setup))
 
     return ld
