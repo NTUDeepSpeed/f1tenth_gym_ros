@@ -50,8 +50,11 @@ WORKDIR /sim_ws
 # PIP_BREAK_SYSTEM_PACKAGES is a no-op on humble and required on jazzy.
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
 
-# The f1tenth_gym dependency lives outside /sim_ws/src so that bind-mounting
-# this repo into the container (see docker-compose.yml) cannot shadow it.
+# The f1tenth_gym dependency lives outside /sim_ws entirely (NTU fork:
+# /opt/f1tenth_gym, upstream uses /sim_ws/f1tenth_gym). The race stack's
+# launch_container.sh bind-mounts a whole workspace OVER /sim_ws, which
+# shadows anything the image put there — and the gym is an editable install,
+# so shadowing its clone breaks `import f1tenth_gym` at runtime.
 ARG GYM_REF=dev-humble
 # Debian-patched pip and RECORD-less distro packages break the install two
 # ways: the stock pip's isolated build env can't run the gym's uv_build
@@ -70,8 +73,8 @@ RUN if [ "${ROS_DISTRO}" = "humble" ]; then \
         touch /tmp/pip-constraints.txt; \
     fi && \
     git clone --depth 1 --branch ${GYM_REF} \
-        https://github.com/f1tenth/f1tenth_gym.git /sim_ws/f1tenth_gym && \
-    pip3 install --ignore-installed -c /tmp/pip-constraints.txt -e /sim_ws/f1tenth_gym
+        https://github.com/f1tenth/f1tenth_gym.git /opt/f1tenth_gym && \
+    pip3 install --ignore-installed -c /tmp/pip-constraints.txt -e /opt/f1tenth_gym
 
 COPY . /sim_ws/src/f1tenth_gym_ros
 
@@ -85,9 +88,11 @@ RUN source /opt/ros/${ROS_DISTRO}/setup.bash && \
     colcon build --symlink-install && \
     rm -rf /var/lib/apt/lists/*
 
-# Interactive shells come up ready to `ros2 launch`
+# Interactive shells come up ready to `ros2 launch`. The overlay source is
+# guarded: with a workspace bind-mounted over /sim_ws there is no install/
+# until the first in-container build.
 RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> /root/.bashrc && \
-    echo "source /sim_ws/install/setup.bash" >> /root/.bashrc
+    echo 'if [ -f /sim_ws/install/setup.bash ]; then source /sim_ws/install/setup.bash; fi' >> /root/.bashrc
 
 # foxglove_bridge websocket (connect Foxglove to ws://localhost:8765)
 EXPOSE 8765
