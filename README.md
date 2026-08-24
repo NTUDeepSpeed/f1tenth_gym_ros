@@ -149,9 +149,12 @@ collides with them (driving through one logs a warning instead of crashing).
   and `ros2 param set /bridge obstacles "x,y,r; ..."` replaces it wholesale.
 - The current set is drawn as latched cylinder markers on `/obstacle_markers`.
 
-The launch file also accepts `map_path:=`, `sx:=`, `sy:=` and `stheta:=`
-overrides so a different track and start pose can be chosen without editing
-`sim.yaml`, e.g. running against a map from another workspace:
+The launch file also accepts `map_path:=`, `sx:=`, `sy:=`, `stheta:=`,
+`steer_angle_max:=` and `mu:=` overrides so a different track, start pose,
+steering range and tyre-road friction can be chosen without editing
+`sim.yaml`. `mu` scales every lateral tyre force of the single-track model
+(preset 1.0489); `mu:=0.3` reproduces a slippery smooth-concrete floor. E.g.
+running against a map from another workspace:
 
 ```bash
 ros2 launch f1tenth_gym_ros gym_bridge_launch.py \

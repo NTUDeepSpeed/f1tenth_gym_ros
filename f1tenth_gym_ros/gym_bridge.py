@@ -290,6 +290,7 @@ class GymBridge(Node):
         # undrivable in the sim without matching the range.
         self.declare_parameter('steer_angle_max', 0.0)
         steer_angle_max = float(self.get_parameter('steer_angle_max').value)
+        mu_preset = float(self.vehicle_params.mu)
         if steer_angle_max > 0.0:
             # VehicleParameters is a frozen dataclass; with_updates is its API
             self.vehicle_params = self.vehicle_params.with_updates(
@@ -298,6 +299,19 @@ class GymBridge(Node):
             self.get_logger().info(
                 f'Steering range overridden to ±{steer_angle_max:.3f} rad '
                 f'(full-lock radius {wheelbase / math.tan(steer_angle_max):.2f} m)')
+        # Optional tyre-road friction override (0.0 keeps the vehicle preset,
+        # f1tenth: mu=1.0489). The ST model scales every lateral tyre force by
+        # mu, so a lower value is a slipperier floor: larger sideslip for the
+        # same steering, slower yaw response, and the drift the real venue's
+        # smooth-finish concrete produces at speed. The stack's measured
+        # lat_accel_limit of 2.8 m/s^2 corresponds to mu ~ 0.3.
+        self.declare_parameter('mu', 0.0)
+        mu = float(self.get_parameter('mu').value)
+        if mu > 0.0:
+            self.vehicle_params = self.vehicle_params.with_updates(mu=mu)
+            self.get_logger().info(
+                f'Friction overridden to mu={mu:.3f} '
+                f'(preset {vehicle_params_key} was {mu_preset:.3f})')
         self.wheel_radius = WHEEL_RADIUS * VEHICLE_MESH_SCALE[vehicle_params_key]
 
         scale = self.get_parameter('scale').value

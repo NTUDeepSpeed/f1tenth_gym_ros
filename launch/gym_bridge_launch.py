@@ -91,7 +91,7 @@ def _launch_setup(context, *args, **kwargs):
         value = LaunchConfiguration(key).perform(context).strip()
         if value:
             cli_overrides[key] = value
-    for key in ('sx', 'sy', 'stheta', 'steer_angle_max'):
+    for key in ('sx', 'sy', 'stheta', 'steer_angle_max', 'mu'):
         value = LaunchConfiguration(key).perform(context).strip()
         if value:
             cli_overrides[key] = float(value)
@@ -326,6 +326,15 @@ def generate_launch_description():
             default_value='',
             description='Steering range override in rad (e.g. 0.65). Empty keeps '
                         "the vehicle preset (f1tenth: ±0.4189, a 0.73 m radius).",
+        )
+    )
+    ld.add_action(
+        DeclareLaunchArgument(
+            'mu',
+            default_value='',
+            description='Tyre-road friction override (e.g. 0.3 for a slippery '
+                        'smooth-concrete floor). Empty keeps the vehicle preset '
+                        '(f1tenth: 1.0489).',
         )
     )
     ld.add_action(
